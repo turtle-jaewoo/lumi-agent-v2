@@ -32,8 +32,8 @@ async def health_check() -> dict:
         dict: 서버 상태 정보
     """
     return {
-        "status": "ok",
-        "tiemstamp": datetime.now(UTC).isoformat(),
+        "status": "healthy",
+        "timestamp": datetime.now(UTC).isoformat(),
         "service": "lumi-agent",
         "version": "0.5.0",
         "environment": settings.environment,
