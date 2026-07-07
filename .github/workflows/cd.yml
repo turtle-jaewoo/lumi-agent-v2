@@ -1,0 +1,364 @@
+# Lumi Agent CD 워크플로우 (GHCR + Compute Engine 배포)
+#
+# 이 워크플로우는 CI(Lumi Agent CI)가 main 브랜치에서 성공한 뒤 실행됩니다.
+# GitHub Actions에서 Docker 이미지를 빌드하고 GHCR에 Push한 후,
+# Compute Engine에서는 Pull만 하여 빠르게 배포합니다.
+#
+# GHCR 방식의 장점:
+#   - GitHub Actions에서 빌드 → Compute Engine 부하 없음
+#   - Compute Engine에서는 Pull만 하면 됨 → 배포 시간 단축 (3분 → 30초)
+#   - 여러 서버 배포 시 한 번만 빌드
+#   - GitHub 통합 (별도 계정 불필요)
+#
+# 주요 단계:
+#   1. GitHub Actions에서 Docker 이미지 빌드
+#   2. GHCR에 이미지 Push
+#   3. Compute Engine에서 이미지 Pull
+#   4. 컨테이너 교체 (다운타임 최소화)
+#   5. 헬스체크 및 롤백 (실패 시)
+#
+# 필요한 GitHub Secrets:
+#   - GCE_HOST: Compute Engine 인스턴스 IP 또는 도메인
+#   - GCE_SSH_KEY: Compute Engine SSH 개인키 (~/.ssh/google_compute_engine 내용)
+#   - GCE_USERNAME: Compute Engine SSH 사용자명 (gcloud 접속 사용자명, 예: appuser)
+#   - UPSTAGE_API_KEY: Upstage API 키
+#   - SUPABASE_URL: Supabase URL
+#   - SUPABASE_KEY: Supabase 키
+
+name: Lumi Agent CD
+
+# TODO 1: 트리거 설정 — CI(Lumi Agent CI)가 main에서 "성공"한 뒤에만 실행되도록
+on:
+  # 여기에 구현하세요!
+  workflow_run:
+    workflows: ["Lumi Agent CI"]
+    types: [completed]
+    branches: [main]
+  # 수동 실행 허용 (긴급 배포/롤백용)
+  workflow_dispatch:
+    inputs:
+      rollback:
+        description: "Rollback to previous version"
+        required: false
+        type: boolean
+        default: false
+
+# TODO 2: GHCR Push 권한 설정
+permissions:
+  # 여기에 구현하세요!
+  contents: read
+  packages: write
+
+# 환경 변수
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/lumi-agent
+
+jobs:
+  # =========================================================
+  # Job 1: Docker 이미지 빌드 & GHCR Push
+  # =========================================================
+  build-and-push:
+    name: Build & Push to GHCR
+    runs-on: ubuntu-latest
+    # [CI 성공 게이트] 이 빌드 잡을 언제 실행할지 결정하는 조건
+    #   · workflow_run(= CI "Lumi Agent CI" 완료 이벤트)인 경우:
+    #       CI 결과 conclusion == 'success' 일 때만 빌드 진행
+    #       → 린트·테스트 실패 시 빌드/배포를 건너뛰어 "깨진 코드 배포"를 방지
+    #   · workflow_dispatch(수동 실행)인 경우: 롤백이 아닐 때만 빌드
+    if: ${{ (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') || (github.event_name == 'workflow_dispatch' && !inputs.rollback) }}
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Docker Buildx 설정 (멀티 플랫폼, 캐시 지원)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ✅ GHCR은 소문자만 허용 → 이미지 이름 소문자 정규화
+      - name: Lowercase image name
+        run: |
+          echo "IMAGE_NAME_LOWER=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      # TODO 3: GHCR 로그인
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          # 여기에 구현하세요!
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 이미지 태그 생성
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+
+      # TODO 4: 이미지 빌드 & Push
+      - name: Build and Push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          # 여기에 구현하세요!
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Print image info
+        run: |
+          echo "📦 이미지 빌드 완료!"
+          echo "Tags: ${{ steps.meta.outputs.tags }}"
+          echo "Digest: ${{ steps.build.outputs.digest }}"
+
+  # =========================================================
+  # Job 2: Compute Engine 배포 (Pull & Run)
+  # =========================================================
+  deploy:
+    name: Deploy to Compute Engine
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    # 빌드 성공 후 실행, 또는 롤백 시 바로 실행
+    if: ${{ always() && (needs.build-and-push.result == 'success' || inputs.rollback) }}
+
+    steps:
+      - name: Deploy to Compute Engine (Normal)
+        if: ${{ !inputs.rollback }}
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.GCE_HOST }}
+          username: ${{ secrets.GCE_USERNAME }}
+          key: ${{ secrets.GCE_SSH_KEY }}
+          script: |
+            set -e
+
+            echo "🚀 배포 시작: ${{ github.sha }}"
+            echo "================================"
+
+            # 환경 변수 설정 (✅ 소문자 정규화 포함)
+            REGISTRY="ghcr.io"
+            IMAGE_NAME=$(echo "${{ github.repository }}/lumi-agent" | tr '[:upper:]' '[:lower:]')
+            IMAGE_TAG=$(echo "${{ github.sha }}" | cut -c1-7)
+            FULL_IMAGE="${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+            DEPLOY_DIR="/home/${{ secrets.GCE_USERNAME }}/lumi-agent"
+
+            # 첫 배포 시 폴더 자동 생성
+            if [ ! -d "$DEPLOY_DIR" ]; then
+              echo "📁 첫 배포: 폴더 생성 중..."
+              mkdir -p $DEPLOY_DIR
+            fi
+
+            cd $DEPLOY_DIR
+
+            # docker-compose.yml 없으면 자동 생성
+            if [ ! -f "docker-compose.yml" ]; then
+              echo "📝 docker-compose.yml 생성 중..."
+              cat > docker-compose.yml << 'COMPOSE_EOF'
+            services:
+              lumi-agent:
+                image: ${LUMI_IMAGE:-ghcr.io/owner/repo/lumi-agent:latest}
+                container_name: lumi-agent
+                restart: unless-stopped
+                ports:
+                  - "8000:8000"
+                env_file:
+                  - .env
+                healthcheck:
+                  test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health/"]
+                  interval: 30s
+                  timeout: 10s
+                  retries: 3
+                  start_period: 10s
+            COMPOSE_EOF
+            fi
+
+            # .env 파일 생성 (GitHub Secrets에서 자동 주입)
+            echo "📝 .env 파일 생성 중..."
+            cat > .env << ENV_EOF
+            ENVIRONMENT=production
+            DEBUG=false
+            UPSTAGE_API_KEY=${{ secrets.UPSTAGE_API_KEY }}
+            SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+            SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}
+            ENV_EOF
+            echo "✅ .env 파일 생성 완료!"
+
+            # Docker Compose 명령어 설정
+            if docker compose version &> /dev/null; then
+              DOCKER_COMPOSE="docker compose"
+            else
+              DOCKER_COMPOSE="docker-compose"
+            fi
+
+            # 현재 버전 백업 (롤백용)
+            if [ -f ".current_image" ]; then
+              cp .current_image .previous_image
+            fi
+            echo "${FULL_IMAGE}" > .current_image
+
+            # Step 1: GHCR 로그인
+            echo "🔐 GHCR 로그인 중..."
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # Step 2: 이미지 Pull (빠름! 10~20초)
+            echo "📦 이미지 Pull 중... (이미 빌드된 이미지)"
+            docker pull ${FULL_IMAGE}
+
+            # Step 3: 환경 변수로 이미지 전달
+            export LUMI_IMAGE=${FULL_IMAGE}
+
+            # Step 4: 컨테이너 교체 (다운타임 최소화)
+            echo "🔄 컨테이너 교체 중..."
+            $DOCKER_COMPOSE up -d --force-recreate
+
+            # Step 5: 헬스체크 (최대 60초 대기)
+            echo "⏳ 헬스체크 중..."
+            MAX_RETRIES=12
+            RETRY_INTERVAL=5
+            for i in $(seq 1 $MAX_RETRIES); do
+              HTTP_STATUS=$(curl -sL -o /dev/null -w "%{http_code}" http://localhost:8000/api/v1/health/ 2>/dev/null || echo "000")
+              if [ "$HTTP_STATUS" -eq 200 ]; then
+                echo "✅ 서버 정상 (HTTP $HTTP_STATUS)"
+                break
+              fi
+              echo "  시도 $i/$MAX_RETRIES (HTTP $HTTP_STATUS)..."
+              if [ "$i" -eq "$MAX_RETRIES" ]; then
+                echo "❌ 헬스체크 실패!"
+                $DOCKER_COMPOSE logs --tail=100
+
+                # 자동 롤백 시도
+                if [ -f ".previous_image" ]; then
+                  echo "🔙 자동 롤백 시도..."
+                  PREV_IMAGE=$(cat .previous_image)
+                  docker pull ${PREV_IMAGE}
+                  export LUMI_IMAGE=${PREV_IMAGE}
+                  $DOCKER_COMPOSE up -d --force-recreate
+                  echo "⚠️ 이전 버전으로 롤백됨: ${PREV_IMAGE}"
+                fi
+                exit 1
+              fi
+              sleep $RETRY_INTERVAL
+            done
+
+            # Step 6: 정리 (오래된 이미지 삭제)
+            docker image prune -af
+
+            echo "================================"
+            echo "🎉 배포 완료: ${FULL_IMAGE}"
+
+      - name: Rollback to previous version
+        if: ${{ inputs.rollback }}
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.GCE_HOST }}
+          username: ${{ secrets.GCE_USERNAME }}
+          key: ${{ secrets.GCE_SSH_KEY }}
+          script: |
+            set -e
+
+            echo "🔙 롤백 시작..."
+
+            cd /home/${{ secrets.GCE_USERNAME }}/lumi-agent
+
+            # Docker Compose 명령어 설정
+            if docker compose version &> /dev/null; then
+              DOCKER_COMPOSE="docker compose"
+            else
+              DOCKER_COMPOSE="docker-compose"
+            fi
+
+            if [ ! -f ".previous_image" ]; then
+              echo "❌ 이전 버전 정보가 없습니다!"
+              exit 1
+            fi
+
+            PREV_IMAGE=$(cat .previous_image)
+            echo "롤백 대상: ${PREV_IMAGE}"
+
+            # GHCR 로그인
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # 이전 이미지 Pull
+            docker pull ${PREV_IMAGE}
+
+            # 환경 변수 설정 및 컨테이너 교체
+            export LUMI_IMAGE=${PREV_IMAGE}
+            $DOCKER_COMPOSE up -d --force-recreate
+
+            # 헬스체크 (retry 로직 추가)
+            echo "⏳ 헬스체크 중..."
+            MAX_RETRIES=12
+            for i in $(seq 1 $MAX_RETRIES); do
+              HTTP_STATUS=$(curl -sL -o /dev/null -w "%{http_code}" http://localhost:8000/api/v1/health/ 2>/dev/null || echo "000")
+              if [ "$HTTP_STATUS" -eq 200 ]; then
+                echo "✅ 롤백 성공!"
+                echo "${PREV_IMAGE}" > .current_image
+                exit 0
+              fi
+              echo "  시도 $i/$MAX_RETRIES (HTTP $HTTP_STATUS)..."
+              sleep 5
+            done
+            echo "❌ 롤백 실패!"
+            $DOCKER_COMPOSE logs --tail=50
+            exit 1
+
+  # =========================================================
+  # Job 3: 알림 (GitHub Summary)
+  # =========================================================
+  notify:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy]
+    if: always()
+
+    steps:
+      - name: Create Summary
+        run: |
+          echo "## 🚀 Lumi Agent 배포 결과" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # 빌드 결과
+          if [ "${{ needs.build-and-push.result }}" == "success" ]; then
+            echo "### ✅ 빌드 성공" >> $GITHUB_STEP_SUMMARY
+            echo "- 이미지: \`ghcr.io/${{ github.repository }}/lumi-agent:$(echo ${{ github.sha }} | cut -c1-7)\`" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.build-and-push.result }}" == "skipped" ]; then
+            echo "### ⏭️ 빌드 스킵 (롤백 모드)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ 빌드 실패" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # 배포 결과
+          if [ "${{ needs.deploy.result }}" == "success" ]; then
+            echo "### ✅ 배포 성공" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ❌ 배포 실패" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # 상세 정보
+          echo "### 📋 상세 정보" >> $GITHUB_STEP_SUMMARY
+          echo "| 항목 | 값 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| 커밋 | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 브랜치 | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 실행자 | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 방식 | GHCR + Compute Engine Pull |" >> $GITHUB_STEP_SUMMARY
+
+          # 롤백 여부
+          if [ "${{ inputs.rollback }}" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> ⚠️ **롤백 모드로 실행됨**" >> $GITHUB_STEP_SUMMARY
+          fi
